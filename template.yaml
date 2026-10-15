@@ -1,0 +1,1157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Conversational NFS-to-Amazon S3 migration with AWS DataSync and Amazon Bedrock
+  AgentCore (MigrationBot). Deploys a simulated on-premises NFS server, a
+  DataSync agent, a destination S3 bucket, a Strands agent hosted on AgentCore
+  Runtime, an AgentCore Gateway, an orchestrator Lambda function, and an Amazon
+  Bedrock Knowledge Base backed by Amazon OpenSearch Serverless. Sample code,
+  not for production use.
+
+# =============================================================================
+# This template references local code: src/orchestrator and src/index_creator
+# (Lambda functions) and, through the AgentCodeBucket/AgentCodeKey parameters,
+# a zip of agent/ built for AgentCore Runtime. Deploy it with scripts/deploy.sh,
+# which builds the zip and runs `aws cloudformation package` first. See README.md.
+# =============================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: General
+        Parameters:
+          - ResourcePrefix
+          - BedrockModelId
+          - OpenSearchStandbyReplicas
+      - Label:
+          default: Agent code (set by scripts/deploy.sh)
+        Parameters:
+          - AgentCodeBucket
+          - AgentCodeKey
+      - Label:
+          default: Simulated on-premises environment
+        Parameters:
+          - NfsDataSizeFiles
+          - AgentInstanceType
+          - AgentActivationCidr
+      - Label:
+          default: Machine images (resolved from AWS Systems Manager public parameters)
+        Parameters:
+          - DataSyncAgentAmiId
+          - NfsServerAmiId
+
+Parameters:
+
+  ResourcePrefix:
+    Type: String
+    Default: migrationbot
+    AllowedPattern: '^[a-z][a-z0-9-]{2,19}$'
+    ConstraintDescription: >
+      3-20 characters: lowercase letters, numbers and hyphens, starting with a
+      letter. The AgentCore Runtime name is limited to 48 characters.
+    Description: Prefix used to name resources.
+
+  BedrockModelId:
+    Type: String
+    Default: us.amazon.nova-pro-v1:0
+    AllowedValues:
+      - us.amazon.nova-pro-v1:0
+      - us.amazon.nova-lite-v1:0
+    Description: >
+      Cross-region inference profile ID for the model that MigrationBot reasons
+      with. Intended for us-east-1 and us-west-2.
+
+  OpenSearchStandbyReplicas:
+    Type: String
+    Default: DISABLED
+    AllowedValues:
+      - DISABLED
+      - ENABLED
+    Description: >
+      Standby replicas for the OpenSearch Serverless collection. DISABLED lowers
+      the minimum capacity (and cost) and is suitable for a demo. Use ENABLED for
+      production, which adds redundancy across Availability Zones. This cannot be
+      changed after the collection is created.
+
+  AgentCodeBucket:
+    Type: String
+    MinLength: 3
+    Description: S3 bucket that holds the agent deployment package (zip for AgentCore Runtime).
+
+  AgentCodeKey:
+    Type: String
+    MinLength: 1
+    Description: S3 key of the agent deployment package.
+
+  NfsDataSizeFiles:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 500
+    Description: Number of 1 MB sample files to generate on the NFS server.
+
+  AgentInstanceType:
+    Type: String
+    Default: m5.2xlarge
+    AllowedValues:
+      - m5.2xlarge
+      - m5.4xlarge
+      - t3.2xlarge
+    Description: EC2 instance type for the DataSync agent.
+
+  AgentActivationCidr:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^(\d{1,3}\.){3}\d{1,3}/(3[0-2]|[12]?\d)$'
+    ConstraintDescription: Must be empty or an IPv4 CIDR block such as 203.0.113.10/32.
+    Description: >
+      CIDR allowed to reach the DataSync agent on TCP 80 so its activation key
+      can be retrieved. Use your own address as a /32. Leave empty to close the
+      port after activation (scripts/deploy.sh does this for you). 0.0.0.0/0 is
+      rejected.
+
+  DataSyncAgentAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/datasync/ami
+    Description: DataSync agent AMI (resolved from the public SSM parameter).
+
+  NfsServerAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Amazon Linux 2023 AMI for the NFS server (resolved from the public SSM parameter).
+
+Rules:
+  ActivationCidrNotOpenToWorld:
+    Assertions:
+      - Assert: !Not [!Equals [!Ref AgentActivationCidr, '0.0.0.0/0']]
+        AssertDescription: AgentActivationCidr must not be 0.0.0.0/0.
+
+Conditions:
+  OpenActivationPort: !Not [!Equals [!Ref AgentActivationCidr, '']]
+
+Resources:
+
+  # ===========================================================================
+  # 1. NETWORKING
+  # ===========================================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Both instances sit in one public subnet and are protected by security
+  # groups. The DataSync agent needs outbound HTTPS to the DataSync public
+  # service endpoint, so the subnet keeps a route to the internet gateway.
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-public-subnet'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  DataSyncAgentSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DataSync agent
+      VpcId: !Ref VPC
+      # TCP 80 is only open while AgentActivationCidr is set. The caller needs
+      # it once to read the activation key; DataSync closes the agent's port 80
+      # after activation, and scripts/deploy.sh then removes this rule.
+      SecurityGroupIngress: !If
+        - OpenActivationPort
+        - - IpProtocol: tcp
+            FromPort: 80
+            ToPort: 80
+            CidrIp: !Ref AgentActivationCidr
+            Description: Temporary - agent activation key retrieval
+        - !Ref AWS::NoValue
+      # The agent connects outbound to the DataSync public service endpoint
+      # over HTTPS. AWS publishes no static CIDR list for these endpoints, so
+      # HTTPS egress is open. The agent also synchronizes its clock over NTP
+      # (UDP 123) with the amazon.pool.ntp.org servers by default, which the
+      # DataSync network requirements list. DNS uses the VPC resolver, which
+      # security groups do not filter. For production, use a DataSync VPC
+      # interface endpoint instead (see README, Security considerations).
+      # NFS egress to the source server is granted by DataSyncAgentSGEgressNfs.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to the DataSync public service endpoint
+        - IpProtocol: udp
+          FromPort: 123
+          ToPort: 123
+          CidrIp: 0.0.0.0/0
+          Description: NTP time synchronization
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-datasync-agent-sg'
+
+  NfsServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Simulated on-premises NFS server
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref DataSyncAgentSG
+          Description: NFS from the DataSync agent
+      # The server installs nfs-utils from the Amazon Linux 2023 repositories
+      # at boot and registers with Systems Manager. Both use HTTPS to AWS
+      # endpoints that have no static CIDR list.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for Systems Manager and package repositories
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-nfs-server-sg'
+
+  # Separate resource avoids a circular dependency between the two groups.
+  DataSyncAgentSGEgressNfs:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref DataSyncAgentSG
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+      DestinationSecurityGroupId: !Ref NfsServerSG
+      Description: NFS to the source server
+
+  # ===========================================================================
+  # 2. EC2 INSTANCES - DataSync agent and NFS server
+  # ===========================================================================
+
+  # Deployed but not activated. scripts/post-deploy.sh activates it.
+  DataSyncAgentInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref AgentInstanceType
+      ImageId: !Ref DataSyncAgentAmiId
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref DataSyncAgentSG
+      # The DataSync agent AMI has a single 80 GiB unencrypted gp2 root volume
+      # (/dev/xvda). This mapping launches it encrypted with the default EBS key.
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 80
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-datasync-agent'
+
+  NfsServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Ref NfsServerAmiId
+      IamInstanceProfile: !Ref NfsServerInstanceProfile
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref NfsServerSG
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf install -y nfs-utils
+
+          mkdir -p /exports/data/finance /exports/data/reports /exports/data/archives
+
+          for i in $(seq 1 ${NfsDataSizeFiles}); do
+            dd if=/dev/urandom of=/exports/data/file_$i.dat bs=1M count=1 2>/dev/null
+          done
+
+          for i in $(seq 1 10); do
+            echo "Financial record $i - $(date)" > /exports/data/finance/record_$i.csv
+            echo "Report $i - $(date)" > /exports/data/reports/report_$i.txt
+          done
+
+          # Export to the VPC only. The security group further limits access
+          # to the DataSync agent.
+          echo "/exports/data 10.0.0.0/16(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
+
+          systemctl enable nfs-server
+          systemctl start nfs-server
+          exportfs -ra
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-nfs-server'
+
+  # ===========================================================================
+  # 3. S3 BUCKETS
+  # ===========================================================================
+
+  MigrationDestinationBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-destination-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-destination'
+
+  MigrationDestinationBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MigrationDestinationBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt MigrationDestinationBucket.Arn
+              - !Sub '${MigrationDestinationBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  KBDocsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-kb-docs-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Name
+          Value: !Sub '${ResourcePrefix}-kb-docs'
+
+  KBDocsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref KBDocsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt KBDocsBucket.Arn
+              - !Sub '${KBDocsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ===========================================================================
+  # 4. CLOUDWATCH LOGS
+  # ===========================================================================
+
+  DataSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/datasync/${ResourcePrefix}'
+      RetentionInDays: 7
+
+  # Allows the DataSync service to write task logs to the log group.
+  DataSyncLogGroupResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub '${ResourcePrefix}-datasync-logs-policy'
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DataSyncLogsToCloudWatchLogs",
+              "Effect": "Allow",
+              "Principal": {"Service": "datasync.amazonaws.com"},
+              "Action": ["logs:PutLogEvents", "logs:CreateLogStream"],
+              "Resource": "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/datasync/${ResourcePrefix}:*",
+              "Condition": {
+                "StringEquals": {"aws:SourceAccount": "${AWS::AccountId}"}
+              }
+            }
+          ]
+        }
+
+  LambdaOrchestratorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+
+  # ===========================================================================
+  # 5. IAM ROLES
+  # ===========================================================================
+
+  NfsServerSSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+
+  NfsServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref NfsServerSSMRole
+
+  DataSyncS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: datasync.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:datasync:${AWS::Region}:${AWS::AccountId}:*'
+      Policies:
+        - PolicyName: DataSyncS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                Resource: !GetAtt MigrationDestinationBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject
+                  - s3:GetObject
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObject
+                  - s3:GetObjectTagging
+                  - s3:PutObjectTagging
+                Resource: !Sub '${MigrationDestinationBucket.Arn}/*'
+
+  LambdaOrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LambdaOrchestratorLogGroup.Arn
+        # DataSync validates the task's CloudWatch log group with the caller's
+        # credentials when the task is created, so the Lambda function needs to
+        # be able to describe log groups (CreateTask fails without it).
+        - PolicyName: DataSyncTaskLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: DescribeLogGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+        - PolicyName: DataSyncOrchestration
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # These actions create new resources, so they cannot be scoped to
+              # resource ARNs that do not exist yet.
+              - Sid: Create
+                Effect: Allow
+                Action:
+                  - datasync:CreateLocationNfs
+                  - datasync:CreateLocationS3
+                  - datasync:CreateTask
+                Resource: '*'
+              - Sid: RunAndInspectTasks
+                Effect: Allow
+                Action:
+                  - datasync:StartTaskExecution
+                  - datasync:DescribeTaskExecution
+                Resource: !Sub 'arn:${AWS::Partition}:datasync:${AWS::Region}:${AWS::AccountId}:task/*'
+        - PolicyName: PassRoleForDataSync
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt DataSyncS3Role.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: datasync.amazonaws.com
+        - PolicyName: KnowledgeBaseRetrieve
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock:Retrieve
+                Resource: !GetAtt KnowledgeBase.KnowledgeBaseArn
+
+  # Assumed by the AgentCore gateway to invoke the orchestrator Lambda function.
+  AgentCoreGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeOrchestratorLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt MigrationOrchestratorFunction.Arn
+
+  # Assumed by AgentCore Runtime while MigrationBot runs. Limited to model
+  # invocation, AgentCore runtime logs/metrics/traces, workload identity, and
+  # invoking the one MigrationBot gateway. Based on the AgentCore Runtime
+  # execution role for direct code deployment.
+  AgentCoreRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*'
+      Policies:
+        - PolicyName: AgentCoreRuntimePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: BedrockModelInvocation
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/amazon.nova-pro-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*::foundation-model/amazon.nova-lite-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/us.amazon.nova-pro-v1:0'
+                  - !Sub 'arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/us.amazon.nova-lite-v1:0'
+              - Sid: RuntimeLogGroups
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*'
+              - Sid: RuntimeLogResourcePolicy
+                Effect: Allow
+                Action: logs:PutResourcePolicy
+                Resource: !Sub
+                  - 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${RuntimeName}-*'
+                  - RuntimeName: !Join
+                      - '_'
+                      - - !Join ['_', !Split ['-', !Ref ResourcePrefix]]
+                        - MigrationBot
+              - Sid: DescribeLogGroups
+                Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+              - Sid: RuntimeLogStreams
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*'
+              # X-Ray actions do not support resource-level permissions.
+              - Sid: Tracing
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+              - Sid: Metrics
+                Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: bedrock-agentcore
+              - Sid: WorkloadIdentity
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetWorkloadAccessToken
+                  - bedrock-agentcore:GetWorkloadAccessTokenForJWT
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default'
+                  - !Sub
+                    - 'arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:workload-identity-directory/default/workload-identity/${RuntimeName}-*'
+                    - RuntimeName: !Join
+                        - '_'
+                        - - !Join ['_', !Split ['-', !Ref ResourcePrefix]]
+                          - MigrationBot
+              - Sid: InvokeMigrationBotGateway
+                Effect: Allow
+                Action: bedrock-agentcore:InvokeGateway
+                Resource: !GetAtt MigrationGateway.GatewayArn
+
+  # Assumed by Amazon Bedrock to read the source documents, create embeddings,
+  # and read/write the OpenSearch Serverless index. The collection ARN cannot be
+  # referenced here (the collection's data access policy names this role), so
+  # access is scoped to collections in this account and Region; the data access
+  # policy then limits the role to this one collection.
+  BedrockKBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}:${AWS::AccountId}:knowledge-base/*'
+      Policies:
+        - PolicyName: KBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: EmbeddingModel
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+              - Sid: ReadSourceDocuments
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${KBDocsBucket.Arn}/*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: ListSourceBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt KBDocsBucket.Arn
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref AWS::AccountId
+              - Sid: VectorStoreAccess
+                Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Sub 'arn:${AWS::Partition}:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+
+  # Runs the custom resource that creates the OpenSearch Serverless vector index.
+  IndexCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: CreateVectorIndex
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: aoss:APIAccessAll
+                Resource: !Sub 'arn:${AWS::Partition}:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+
+  # ===========================================================================
+  # 6. ORCHESTRATOR LAMBDA FUNCTION
+  # ===========================================================================
+
+  # Source: src/orchestrator (index.py dispatches to datasync_tools.py).
+  # `aws cloudformation package` replaces the local Code path with an S3 location.
+  MigrationOrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt LambdaOrchestratorRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref LambdaOrchestratorLogGroup
+      Environment:
+        Variables:
+          DATASYNC_S3_ROLE_ARN: !GetAtt DataSyncS3Role.Arn
+          LOG_GROUP_ARN: !GetAtt DataSyncLogGroup.Arn
+          KNOWLEDGE_BASE_ID: !Ref KnowledgeBase
+      Code: src/orchestrator/
+
+  # ===========================================================================
+  # 7. AMAZON BEDROCK AGENTCORE
+  # ===========================================================================
+  #   Runtime (Strands agent) -> Gateway (MCP, SigV4) -> Lambda target
+  # The orchestrator Lambda function is exposed to the agent as MCP tools: the
+  # five DataSync tools and a knowledge base search tool.
+
+  MigrationGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub '${ResourcePrefix}-gateway'
+      Description: MigrationBot tool gateway (DataSync orchestration and knowledge base search)
+      ProtocolType: MCP
+      AuthorizerType: AWS_IAM
+      RoleArn: !GetAtt AgentCoreGatewayRole.Arn
+
+  MigrationGatewayTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt MigrationGateway.GatewayIdentifier
+      Name: MigrationActions
+      Description: DataSync migration orchestration and knowledge base search
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt MigrationOrchestratorFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: create_nfs_location
+                  Description: Register an NFS file share as a DataSync source location.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      server_hostname:
+                        Type: string
+                        Description: NFS server IP address or DNS name
+                      subdirectory:
+                        Type: string
+                        Description: Export path on the NFS server, for example /exports/data
+                      agent_arn:
+                        Type: string
+                        Description: ARN of the activated DataSync agent
+                    Required:
+                      - server_hostname
+                      - subdirectory
+                      - agent_arn
+
+                - Name: create_s3_location
+                  Description: >
+                    Register an Amazon S3 bucket as a DataSync destination location.
+                    The IAM role defaults to the stack's DataSync S3 access role.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      s3_bucket_arn:
+                        Type: string
+                        Description: ARN of the S3 bucket, for example arn:aws:s3:::my-bucket
+                      role_arn:
+                        Type: string
+                        Description: Optional IAM role ARN that DataSync uses to access the bucket
+                    Required:
+                      - s3_bucket_arn
+
+                - Name: create_migration_task
+                  Description: >
+                    Create a DataSync task that links a source location to a
+                    destination location.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      source_location_arn:
+                        Type: string
+                        Description: ARN of the source (NFS) location
+                      destination_location_arn:
+                        Type: string
+                        Description: ARN of the destination (S3) location
+                      task_name:
+                        Type: string
+                        Description: Optional friendly name for the task
+                    Required:
+                      - source_location_arn
+                      - destination_location_arn
+
+                - Name: start_migration
+                  Description: Start a DataSync task execution to begin the transfer.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      task_arn:
+                        Type: string
+                        Description: ARN of the DataSync task to execute
+                    Required:
+                      - task_arn
+
+                - Name: get_migration_status
+                  Description: >
+                    Report the status of a DataSync task execution, including
+                    files transferred and bytes transferred.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      task_execution_arn:
+                        Type: string
+                        Description: ARN of the task execution to check
+                    Required:
+                      - task_execution_arn
+
+                - Name: search_knowledge_base
+                  Description: >
+                    Search the migration knowledge base (DataSync best practices,
+                    migration strategies, cutover procedures) and return the most
+                    relevant passages with their source documents.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      query:
+                        Type: string
+                        Description: Natural-language question or search phrase
+                    Required:
+                      - query
+
+  # AgentCore Runtime names allow letters, digits and underscores, so hyphens in
+  # the prefix are converted: migrationbot -> migrationbot_MigrationBot.
+  # A Runtime always has a DEFAULT endpoint, which is what clients invoke.
+  MigrationBotRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn: MigrationGatewayTarget
+    Properties:
+      AgentRuntimeName: !Join
+        - '_'
+        - - !Join ['_', !Split ['-', !Ref ResourcePrefix]]
+          - MigrationBot
+      Description: MigrationBot - Strands agent that orchestrates AWS DataSync migrations
+      RoleArn: !GetAtt AgentCoreRuntimeRole.Arn
+      AgentRuntimeArtifact:
+        CodeConfiguration:
+          Code:
+            S3:
+              Bucket: !Ref AgentCodeBucket
+              Prefix: !Ref AgentCodeKey
+          Runtime: PYTHON_3_12
+          EntryPoint:
+            - migrationbot.py
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      ProtocolConfiguration: HTTP
+      EnvironmentVariables:
+        GATEWAY_URL: !GetAtt MigrationGateway.GatewayUrl
+        MODEL_ID: !Ref BedrockModelId
+        MIGRATIONBOT_REGION: !Ref AWS::Region
+
+  # ===========================================================================
+  # 8. BEDROCK KNOWLEDGE BASE (Amazon OpenSearch Serverless)
+  # ===========================================================================
+
+  OSSEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ResourcePrefix}-enc'
+      Type: encryption
+      Policy: !Sub >
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${ResourcePrefix}-kb-vectors"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  # Amazon Bedrock reaches a bring-your-own collection over its public
+  # endpoint. Access is still limited by IAM and the data access policy below.
+  OSSNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ResourcePrefix}-net'
+      Type: network
+      Policy: !Sub >
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${ResourcePrefix}-kb-vectors"]
+              }
+            ],
+            "AllowFromPublic": true
+          }
+        ]
+
+  # Only the Knowledge Base role (read/write documents) and the index creator
+  # function (create the index) can use the collection. Add your own IAM
+  # principal here if you want to browse it with the OpenSearch APIs.
+  OSSDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub '${ResourcePrefix}-access'
+      Type: data
+      Policy: !Sub >
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${ResourcePrefix}-kb-vectors"],
+                "Permission": [
+                  "aoss:DescribeCollectionItems",
+                  "aoss:CreateCollectionItems",
+                  "aoss:UpdateCollectionItems"
+                ]
+              },
+              {
+                "ResourceType": "index",
+                "Resource": ["index/${ResourcePrefix}-kb-vectors/*"],
+                "Permission": [
+                  "aoss:CreateIndex",
+                  "aoss:DescribeIndex",
+                  "aoss:UpdateIndex",
+                  "aoss:ReadDocument",
+                  "aoss:WriteDocument"
+                ]
+              }
+            ],
+            "Principal": [
+              "${BedrockKBRole.Arn}",
+              "${IndexCreatorRole.Arn}"
+            ]
+          }
+        ]
+
+  # This is a Classic collection on purpose: it is not placed in a (NextGen)
+  # collection group. Reports from users show the Bedrock Knowledge Bases
+  # Retrieve API failing with a SigV4 checksum error against NextGen collections
+  # while ingestion succeeds, so do not add CollectionGroupName here unless you
+  # have confirmed that Retrieve works. Classic collections do not scale to zero.
+  OSSCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - OSSEncryptionPolicy
+      - OSSNetworkPolicy
+      - OSSDataAccessPolicy
+    Properties:
+      Name: !Sub '${ResourcePrefix}-kb-vectors'
+      Type: VECTORSEARCH
+      StandbyReplicas: !Ref OpenSearchStandbyReplicas
+      Description: Vector store for the MigrationBot Knowledge Base
+
+  # Source: src/index_creator/index.py. Amazon Bedrock does not create the
+  # vector index in a bring-your-own collection, so this function does.
+  IndexCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 600
+      MemorySize: 256
+      Role: !GetAtt IndexCreatorRole.Arn
+      Code: src/index_creator/
+
+  # The index dimension (1,024) must match Amazon Titan Text Embeddings V2.
+  VectorIndex:
+    Type: Custom::OpenSearchIndex
+    Properties:
+      ServiceToken: !GetAtt IndexCreatorFunction.Arn
+      CollectionEndpoint: !GetAtt OSSCollection.CollectionEndpoint
+      IndexName: !Sub '${ResourcePrefix}-kb-index'
+      Dimension: 1024
+      Region: !Ref AWS::Region
+
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: VectorIndex
+    Properties:
+      Name: !Sub '${ResourcePrefix}-datasync-kb'
+      Description: DataSync best practices for MigrationBot
+      RoleArn: !GetAtt BedrockKBRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0'
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: 1024
+              EmbeddingDataType: FLOAT32
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !GetAtt OSSCollection.Arn
+          VectorIndexName: !Sub '${ResourcePrefix}-kb-index'
+          FieldMapping:
+            VectorField: embedding
+            TextField: text
+            MetadataField: metadata
+
+  KBDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref KnowledgeBase
+      Name: datasync-docs
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt KBDocsBucket.Arn
+
+Outputs:
+
+  DataSyncAgentPublicIp:
+    Description: Public IP of the DataSync agent (used by scripts/post-deploy.sh for activation)
+    Value: !GetAtt DataSyncAgentInstance.PublicIp
+
+  NfsServerPrivateIp:
+    Description: Private IP of the simulated on-premises NFS server
+    Value: !GetAtt NfsServerInstance.PrivateIp
+
+  MigrationDestinationBucketName:
+    Description: Name of the S3 migration destination bucket
+    Value: !Ref MigrationDestinationBucket
+
+  MigrationDestinationBucketArn:
+    Description: ARN of the S3 migration destination bucket
+    Value: !GetAtt MigrationDestinationBucket.Arn
+
+  DataSyncS3RoleArn:
+    Description: IAM role ARN DataSync uses to write to the destination bucket
+    Value: !GetAtt DataSyncS3Role.Arn
+
+  DataSyncLogGroupArn:
+    Description: CloudWatch log group ARN for DataSync task logs
+    Value: !GetAtt DataSyncLogGroup.Arn
+
+  AgentRuntimeArn:
+    Description: ARN of the MigrationBot AgentCore Runtime (use with InvokeAgentRuntime)
+    Value: !GetAtt MigrationBotRuntime.AgentRuntimeArn
+
+  AgentRuntimeName:
+    Description: Name of the MigrationBot AgentCore Runtime
+    Value: !Join
+      - '_'
+      - - !Join ['_', !Split ['-', !Ref ResourcePrefix]]
+        - MigrationBot
+
+  AgentCoreGatewayArn:
+    Description: AgentCore gateway ARN exposing the MigrationBot tools
+    Value: !GetAtt MigrationGateway.GatewayArn
+
+  AgentCoreGatewayUrl:
+    Description: AgentCore gateway MCP endpoint
+    Value: !GetAtt MigrationGateway.GatewayUrl
+
+  OpenSearchCollectionArn:
+    Description: ARN of the OpenSearch Serverless collection that stores the vectors
+    Value: !GetAtt OSSCollection.Arn
+
+  KBDocsBucketName:
+    Description: S3 bucket holding the Knowledge Base source documents
+    Value: !Ref KBDocsBucket
+
+  KnowledgeBaseId:
+    Description: Bedrock Knowledge Base ID
+    Value: !Ref KnowledgeBase
+
+  KnowledgeBaseDataSourceId:
+    Description: Bedrock Knowledge Base data source ID
+    Value: !GetAtt KBDataSource.DataSourceId
