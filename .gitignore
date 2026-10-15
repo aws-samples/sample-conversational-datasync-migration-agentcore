@@ -1,0 +1,10 @@
+.packaged-template.yaml
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.env
+*.log
+cdk.out/
+.ash/
+build/
