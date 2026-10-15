@@ -587,6 +587,7 @@ For any feedback, questions, or suggestions, use the [Issues](https://github.com
 ## Authors
 
 **Khushi Khokhar** – Associate Delivery Consultant with AWS Professional Services, specialized in cloud migration.
+<br></br>
 **Nishtha Yadav** – Associate Delivery Consultant with AWS Professional Services, specialized in DevOps.
 
 ## Security
