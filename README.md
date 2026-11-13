@@ -139,7 +139,7 @@ scripts/deploy.sh
 
 1. Detects your public IP address and creates a private S3 bucket for deployment artifacts that denies requests not made over TLS, unless you set `ARTIFACT_BUCKET`.
 2. Builds the agent package: it downloads the arm64 dependencies from `agent/requirements.txt`, adds `agent/migrationbot.py`, zips them and uploads the zip. AgentCore Runtime runs on arm64 and does not install dependencies when it starts.
-3. Runs `aws cloudformation package` (which uploads the Lambda code) and deploys the stack with the tags `Project=conversational-datasync-migration` and `Purpose=sample`. TCP 80 on the DataSync agent is opened only to your public IP address.
+3. Runs `aws cloudformation package` (which uploads the Lambda code) and deploys the stack with the tags `Project=conversational-datasync-migration` and `Purpose=sample`. It turns Lambda reserved concurrency off, with a warning, if your account's concurrency limit is too low for it. TCP 80 on the DataSync agent is opened only to your public IP address.
 4. Runs `scripts/post-deploy.sh`, which uploads the knowledge base document, starts knowledge base ingestion, retrieves the agent's activation key and activates the DataSync agent.
 5. Updates the stack to remove the TCP 80 rule.
 
@@ -153,7 +153,7 @@ When it finishes, the script prints the values you need for the example prompts:
 | `ARTIFACT_BUCKET` | `<stack>-artifacts-<account>-<region>`, created for you | Bucket for the Lambda code and the agent package |
 | `ACTIVATION_CIDR` | your public IP as a `/32` | CIDR allowed on TCP 80 of the agent during activation |
 | `BEDROCK_MODEL_ID` | `us.amazon.nova-pro-v1:0` | Model for the agent (`us.amazon.nova-pro-v1:0` or `us.amazon.nova-lite-v1:0`) |
-| `LAMBDA_RESERVED_CONCURRENCY` | `ENABLED` | Sets the `LambdaReservedConcurrency` template parameter. Use `DISABLED` if your account's Lambda concurrency quota is 10 |
+| `LAMBDA_RESERVED_CONCURRENCY` | detected | Sets the `LambdaReservedConcurrency` template parameter. If unset, the script reads your account's Lambda concurrency and uses `ENABLED` when the reservation fits, or `DISABLED` with a warning when it doesn't (for example in new accounts limited to 10 concurrent executions) |
 
 **Template parameters.**
 
@@ -162,7 +162,7 @@ When it finishes, the script prints the values you need for the example prompts:
 | `ResourcePrefix` | `migrationbot` | Prefix for resource names |
 | `BedrockModelId` | `us.amazon.nova-pro-v1:0` | Model for the agent (Nova Pro or Nova Lite) |
 | `OpenSearchStandbyReplicas` | `DISABLED` | `DISABLED` lowers the minimum capacity of the vector collection. Use `ENABLED` for production. Cannot be changed later |
-| `LambdaReservedConcurrency` | `ENABLED` | Reserves concurrency of 5 for the orchestrator function and 1 for the index creator function. Lambda rejects any reservation in accounts whose concurrent executions quota is still the new-account default of 10, so use `DISABLED` there or request a quota increase |
+| `LambdaReservedConcurrency` | `ENABLED` | Reserves concurrency of 5 for the orchestrator function and 1 for the index creator function. Lambda rejects the reservation if it would leave less unreserved concurrency than the account minimum (100, or the whole limit in accounts limited to fewer than 100, such as new accounts at 10), so use `DISABLED` there or request a quota increase. `scripts/deploy.sh` picks the value for you |
 | `NfsDataSizeFiles` | `50` | Number of 1 MB sample files on the NFS server |
 | `AgentInstanceType` | `m5.2xlarge` | EC2 instance type for the DataSync agent |
 | `AgentActivationCidr` | empty | CIDR allowed on TCP 80 during activation. `0.0.0.0/0` is rejected |
@@ -225,7 +225,7 @@ aws cloudformation package --template-file template.yaml --s3-bucket "$ARTIFACT_
 aws cloudformation deploy --template-file .packaged-template.yaml --stack-name "$STACK_NAME" --capabilities CAPABILITY_IAM --parameter-overrides ResourcePrefix=$STACK_NAME AgentActivationCidr=$ACTIVATION_CIDR AgentCodeBucket=$ARTIFACT_BUCKET AgentCodeKey=$AGENT_KEY --tags Project=conversational-datasync-migration Purpose=sample
 ```
 
-If your account's Lambda concurrency quota is 10, add `LambdaReservedConcurrency=DISABLED` to `--parameter-overrides` here and in step 7.
+The template reserves Lambda concurrency by default. Lambda rejects the reservation, and the stack rolls back, if it would leave your account with less unreserved concurrency than its minimum. Check your limit with `aws lambda get-account-settings --query AccountLimit`. If `UnreservedConcurrentExecutions` is below 106 (new accounts can start at 10), add `LambdaReservedConcurrency=DISABLED` to `--parameter-overrides` here and in step 7. `scripts/deploy.sh` does this check for you.
 
 The stack creates the VPC, the two EC2 instances, the S3 buckets, the IAM roles, the Lambda functions, the AgentCore Gateway and Runtime, the OpenSearch Serverless collection and its vector index, and the Knowledge Base.
 

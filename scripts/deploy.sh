@@ -13,8 +13,9 @@
 #                     activation. Defaults to your public IP (/32).
 #   BEDROCK_MODEL_ID  Overrides the BedrockModelId template parameter.
 #   LAMBDA_RESERVED_CONCURRENCY
-#                     ENABLED (default) or DISABLED. Use DISABLED in accounts
-#                     whose Lambda concurrency quota is still 10.
+#                     ENABLED or DISABLED. If unset, the script checks the
+#                     account's Lambda concurrency and uses ENABLED when the
+#                     reservation fits, DISABLED (with a warning) otherwise.
 #   AWS_REGION        Deployment Region (us-east-1 or us-west-2).
 
 set -euo pipefail
@@ -114,9 +115,55 @@ PARAMS=(
 if [[ -n "${BEDROCK_MODEL_ID:-}" ]]; then
   PARAMS+=("BedrockModelId=${BEDROCK_MODEL_ID}")
 fi
-if [[ -n "${LAMBDA_RESERVED_CONCURRENCY:-}" ]]; then
-  PARAMS+=("LambdaReservedConcurrency=${LAMBDA_RESERVED_CONCURRENCY}")
+
+# Reserved concurrency (5 for the orchestrator, 1 for the index creator) caps
+# how many tool calls can run at once. Lambda rejects a reservation that would
+# leave the account with less unreserved concurrency than its minimum, which is
+# 100, or the whole limit in accounts whose limit is below 100 (new accounts can
+# start at 10). Unless LAMBDA_RESERVED_CONCURRENCY is set, check the account and
+# turn the reservation off only when it cannot fit.
+RESERVED_NEEDED=6
+if [[ -z "${LAMBDA_RESERVED_CONCURRENCY:-}" ]]; then
+  read -r LAMBDA_LIMIT LAMBDA_UNRESERVED < <(aws lambda get-account-settings \
+    --query '[AccountLimit.ConcurrentExecutions,AccountLimit.UnreservedConcurrentExecutions]' \
+    --output text)
+  if [[ ! "${LAMBDA_LIMIT:-}" =~ ^[0-9]+$ || ! "${LAMBDA_UNRESERVED:-}" =~ ^[0-9]+$ ]]; then
+    echo "Could not read the Lambda concurrency limit. Set LAMBDA_RESERVED_CONCURRENCY to ENABLED or DISABLED." >&2
+    exit 1
+  fi
+  # On a stack update, this stack's own reservations are already subtracted
+  # from the unreserved pool, so add them back before comparing.
+  for fn in MigrationOrchestratorFunction IndexCreatorFunction; do
+    fn_name="$(aws cloudformation describe-stack-resource --stack-name "${STACK_NAME}" \
+      --logical-resource-id "${fn}" --query StackResourceDetail.PhysicalResourceId \
+      --output text 2>/dev/null || true)"
+    if [[ -n "${fn_name}" && "${fn_name}" != "None" ]]; then
+      fn_reserved="$(aws lambda get-function-concurrency --function-name "${fn_name}" \
+        --query ReservedConcurrentExecutions --output text 2>/dev/null || true)"
+      if [[ "${fn_reserved}" =~ ^[0-9]+$ ]]; then
+        LAMBDA_UNRESERVED=$((LAMBDA_UNRESERVED + fn_reserved))
+      fi
+    fi
+  done
+  LAMBDA_MIN_UNRESERVED=$((LAMBDA_LIMIT < 100 ? LAMBDA_LIMIT : 100))
+  if ((LAMBDA_UNRESERVED - RESERVED_NEEDED >= LAMBDA_MIN_UNRESERVED)); then
+    LAMBDA_RESERVED_CONCURRENCY=ENABLED
+  else
+    LAMBDA_RESERVED_CONCURRENCY=DISABLED
+    echo "Warning: this account's Lambda concurrency limit is ${LAMBDA_LIMIT} (${LAMBDA_UNRESERVED} unreserved)," >&2
+    echo "  too low to reserve ${RESERVED_NEEDED}. Deploying without reserved concurrency. Request a" >&2
+    echo "  Lambda concurrent executions quota increase and re-run to enable it." >&2
+  fi
 fi
+case "${LAMBDA_RESERVED_CONCURRENCY}" in
+  ENABLED | DISABLED) ;;
+  *)
+    echo "LAMBDA_RESERVED_CONCURRENCY must be ENABLED or DISABLED." >&2
+    exit 1
+    ;;
+esac
+echo "Lambda reserved concurrency: ${LAMBDA_RESERVED_CONCURRENCY}"
+PARAMS+=("LambdaReservedConcurrency=${LAMBDA_RESERVED_CONCURRENCY}")
 
 # Stack tags propagate to the resources CloudFormation creates, so leftover
 # resources can be found and attributed to this sample.
