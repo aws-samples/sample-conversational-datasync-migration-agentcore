@@ -71,7 +71,7 @@ def invoke(payload):
     user_message = (payload or {}).get("prompt", "")
     if not user_message:
         return {"result": "Send a JSON payload such as {\"prompt\": \"What tools do you have?\"}."}
-    logger.info("User input: %s", user_message)
+    logger.info("User input received (%d characters)", len(user_message))
     try:
         agent = _get_agent()
     except Exception:

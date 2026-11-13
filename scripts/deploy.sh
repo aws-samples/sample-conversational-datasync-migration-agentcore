@@ -12,6 +12,9 @@
 #   ACTIVATION_CIDR   CIDR allowed to reach the DataSync agent on TCP 80 during
 #                     activation. Defaults to your public IP (/32).
 #   BEDROCK_MODEL_ID  Overrides the BedrockModelId template parameter.
+#   LAMBDA_RESERVED_CONCURRENCY
+#                     ENABLED (default) or DISABLED. Use DISABLED in accounts
+#                     whose Lambda concurrency quota is still 10.
 #   AWS_REGION        Deployment Region (us-east-1 or us-west-2).
 
 set -euo pipefail
@@ -54,6 +57,17 @@ if [[ -z "${ARTIFACT_BUCKET:-}" ]]; then
     aws s3api put-public-access-block --bucket "${ARTIFACT_BUCKET}" \
       --public-access-block-configuration \
       BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+    # The bucket holds the code that Lambda and AgentCore Runtime run, so
+    # refuse any request that is not made over TLS.
+    aws s3api put-bucket-policy --bucket "${ARTIFACT_BUCKET}" --policy "{
+      \"Version\": \"2012-10-17\",
+      \"Statement\": [{
+        \"Sid\": \"DenyInsecureTransport\", \"Effect\": \"Deny\", \"Principal\": \"*\",
+        \"Action\": \"s3:*\",
+        \"Resource\": [\"arn:aws:s3:::${ARTIFACT_BUCKET}\", \"arn:aws:s3:::${ARTIFACT_BUCKET}/*\"],
+        \"Condition\": {\"Bool\": {\"aws:SecureTransport\": \"false\"}}
+      }]
+    }"
   fi
 fi
 
@@ -100,6 +114,16 @@ PARAMS=(
 if [[ -n "${BEDROCK_MODEL_ID:-}" ]]; then
   PARAMS+=("BedrockModelId=${BEDROCK_MODEL_ID}")
 fi
+if [[ -n "${LAMBDA_RESERVED_CONCURRENCY:-}" ]]; then
+  PARAMS+=("LambdaReservedConcurrency=${LAMBDA_RESERVED_CONCURRENCY}")
+fi
+
+# Stack tags propagate to the resources CloudFormation creates, so leftover
+# resources can be found and attributed to this sample.
+TAGS=(
+  "Project=conversational-datasync-migration"
+  "Purpose=sample"
+)
 
 echo "==> Deploying CloudFormation stack (this takes several minutes)"
 aws cloudformation deploy \
@@ -107,7 +131,8 @@ aws cloudformation deploy \
   --stack-name "${STACK_NAME}" \
   --capabilities CAPABILITY_IAM \
   --no-fail-on-empty-changeset \
-  --parameter-overrides "${PARAMS[@]}"
+  --parameter-overrides "${PARAMS[@]}" \
+  --tags "${TAGS[@]}"
 
 "${SCRIPT_DIR}/post-deploy.sh" "${STACK_NAME}"
 
@@ -119,7 +144,8 @@ aws cloudformation deploy \
   --stack-name "${STACK_NAME}" \
   --capabilities CAPABILITY_IAM \
   --no-fail-on-empty-changeset \
-  --parameter-overrides "${CLOSE_PARAMS[@]}"
+  --parameter-overrides "${CLOSE_PARAMS[@]}" \
+  --tags "${TAGS[@]}"
 
 echo
 echo "MigrationBot is ready. Start a conversation with:"

@@ -19,10 +19,13 @@ kb_runtime = boto3.client("bedrock-agent-runtime")
 
 DELIMITER = "___"
 MAX_PASSAGE_CHARS = 1200
+MAX_QUERY_CHARS = 1000
 
 
 def search_knowledge_base(query: str) -> str:
     """Search the migration best-practices knowledge base."""
+    if not isinstance(query, str) or not query.strip() or len(query) > MAX_QUERY_CHARS:
+        raise ValueError(f"Invalid value for query (1 to {MAX_QUERY_CHARS} characters)")
     response = kb_runtime.retrieve(
         knowledgeBaseId=os.environ["KNOWLEDGE_BASE_ID"],
         retrievalQuery={"text": query},
@@ -62,8 +65,11 @@ def lambda_handler(event, context):
     function = TOOLS.get(tool)
     if function is None:
         return {"result": f"Unknown function: {tool}"}
+    event = event or {}
+    if not isinstance(event, dict):
+        return {"result": f"Error executing {tool}: arguments must be a JSON object"}
     accepted = inspect.signature(function).parameters
-    arguments = {k: v for k, v in (event or {}).items() if k in accepted}
+    arguments = {k: v for k, v in event.items() if k in accepted}
     try:
         return {"result": function(**arguments)}
     except Exception as exc:  # surfaced to the agent so it can report the problem

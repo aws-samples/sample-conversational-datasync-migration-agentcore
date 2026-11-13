@@ -61,7 +61,7 @@ The editable source is [`docs/migration-flow.drawio`](docs/migration-flow.drawio
 
 1. **Ask MigrationBot.** The engineer sends a prompt. The Strands agent on AgentCore Runtime picks a tool and calls it through AgentCore Gateway. The orchestrator Lambda function runs it, and the answer travels back the same way (the two-way arrows). Within a session the agent remembers earlier ARNs. If the session has ended, paste them again.
 2. **Register source** with `create_nfs_location`. Inputs: the NFS server's private IP, the export path (`/exports/data`) and the DataSync agent ARN. Result: an NFS location ARN.
-3. **Register destination** with `create_s3_location`. Input: the destination bucket ARN. The IAM role defaults to the stack's DataSync S3 access role. Result: an S3 location ARN.
+3. **Register destination** with `create_s3_location`. Input: the destination bucket ARN. DataSync always uses the stack's DataSync S3 access role, which can reach only the destination bucket. Result: an S3 location ARN.
 4. **Create task** with `create_migration_task`. Inputs: the two location ARNs and a task name. The task is created with log level `TRANSFER` and verification of transferred files only, and it logs to the stack's CloudWatch log group. Result: a task ARN.
 5. **Start transfer** with `start_migration`. Input: the task ARN. Result: a task execution ARN.
 6. **Move data.** DataSync directs the agent, which reads the NFS export over TCP 2049 and sends the data to the DataSync service over HTTPS. DataSync writes the objects to the destination bucket.
@@ -137,9 +137,9 @@ scripts/deploy.sh
 
 **What the script does:**
 
-1. Detects your public IP address and creates a private S3 bucket for deployment artifacts, unless you set `ARTIFACT_BUCKET`.
+1. Detects your public IP address and creates a private S3 bucket for deployment artifacts that denies requests not made over TLS, unless you set `ARTIFACT_BUCKET`.
 2. Builds the agent package: it downloads the arm64 dependencies from `agent/requirements.txt`, adds `agent/migrationbot.py`, zips them and uploads the zip. AgentCore Runtime runs on arm64 and does not install dependencies when it starts.
-3. Runs `aws cloudformation package` (which uploads the Lambda code) and deploys the stack. TCP 80 on the DataSync agent is opened only to your public IP address.
+3. Runs `aws cloudformation package` (which uploads the Lambda code) and deploys the stack with the tags `Project=conversational-datasync-migration` and `Purpose=sample`. TCP 80 on the DataSync agent is opened only to your public IP address.
 4. Runs `scripts/post-deploy.sh`, which uploads the knowledge base document, starts knowledge base ingestion, retrieves the agent's activation key and activates the DataSync agent.
 5. Updates the stack to remove the TCP 80 rule.
 
@@ -153,6 +153,7 @@ When it finishes, the script prints the values you need for the example prompts:
 | `ARTIFACT_BUCKET` | `<stack>-artifacts-<account>-<region>`, created for you | Bucket for the Lambda code and the agent package |
 | `ACTIVATION_CIDR` | your public IP as a `/32` | CIDR allowed on TCP 80 of the agent during activation |
 | `BEDROCK_MODEL_ID` | `us.amazon.nova-pro-v1:0` | Model for the agent (`us.amazon.nova-pro-v1:0` or `us.amazon.nova-lite-v1:0`) |
+| `LAMBDA_RESERVED_CONCURRENCY` | `ENABLED` | Sets the `LambdaReservedConcurrency` template parameter. Use `DISABLED` if your account's Lambda concurrency quota is 10 |
 
 **Template parameters.**
 
@@ -161,6 +162,7 @@ When it finishes, the script prints the values you need for the example prompts:
 | `ResourcePrefix` | `migrationbot` | Prefix for resource names |
 | `BedrockModelId` | `us.amazon.nova-pro-v1:0` | Model for the agent (Nova Pro or Nova Lite) |
 | `OpenSearchStandbyReplicas` | `DISABLED` | `DISABLED` lowers the minimum capacity of the vector collection. Use `ENABLED` for production. Cannot be changed later |
+| `LambdaReservedConcurrency` | `ENABLED` | Reserves concurrency of 5 for the orchestrator function and 1 for the index creator function. Lambda rejects any reservation in accounts whose concurrent executions quota is still the new-account default of 10, so use `DISABLED` there or request a quota increase |
 | `NfsDataSizeFiles` | `50` | Number of 1 MB sample files on the NFS server |
 | `AgentInstanceType` | `m5.2xlarge` | EC2 instance type for the DataSync agent |
 | `AgentActivationCidr` | empty | CIDR allowed on TCP 80 during activation. `0.0.0.0/0` is rejected |
@@ -194,9 +196,10 @@ export ACTIVATION_CIDR="$(curl -fsS https://checkip.amazonaws.com | tr -d '[:spa
 ```bash
 aws s3api create-bucket --bucket "$ARTIFACT_BUCKET"
 aws s3api put-public-access-block --bucket "$ARTIFACT_BUCKET" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+aws s3api put-bucket-policy --bucket "$ARTIFACT_BUCKET" --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"DenyInsecureTransport\",\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:*\",\"Resource\":[\"arn:aws:s3:::${ARTIFACT_BUCKET}\",\"arn:aws:s3:::${ARTIFACT_BUCKET}/*\"],\"Condition\":{\"Bool\":{\"aws:SecureTransport\":\"false\"}}}]}"
 ```
 
-In any Region other than `us-east-1`, add `--create-bucket-configuration LocationConstraint=$AWS_REGION` to the first command.
+In any Region other than `us-east-1`, add `--create-bucket-configuration LocationConstraint=$AWS_REGION` to the first command. The bucket policy denies any request that is not made over TLS, because the bucket holds the code that Lambda and AgentCore Runtime run.
 
 ### Step 4: Build and upload the agent package
 
@@ -219,8 +222,10 @@ If you change the agent later, upload it under a new key (for example `-v2.zip`)
 
 ```bash
 aws cloudformation package --template-file template.yaml --s3-bucket "$ARTIFACT_BUCKET" --output-template-file .packaged-template.yaml
-aws cloudformation deploy --template-file .packaged-template.yaml --stack-name "$STACK_NAME" --capabilities CAPABILITY_IAM --parameter-overrides ResourcePrefix=$STACK_NAME AgentActivationCidr=$ACTIVATION_CIDR AgentCodeBucket=$ARTIFACT_BUCKET AgentCodeKey=$AGENT_KEY
+aws cloudformation deploy --template-file .packaged-template.yaml --stack-name "$STACK_NAME" --capabilities CAPABILITY_IAM --parameter-overrides ResourcePrefix=$STACK_NAME AgentActivationCidr=$ACTIVATION_CIDR AgentCodeBucket=$ARTIFACT_BUCKET AgentCodeKey=$AGENT_KEY --tags Project=conversational-datasync-migration Purpose=sample
 ```
+
+If your account's Lambda concurrency quota is 10, add `LambdaReservedConcurrency=DISABLED` to `--parameter-overrides` here and in step 7.
 
 The stack creates the VPC, the two EC2 instances, the S3 buckets, the IAM roles, the Lambda functions, the AgentCore Gateway and Runtime, the OpenSearch Serverless collection and its vector index, and the Knowledge Base.
 
@@ -233,7 +238,7 @@ scripts/post-deploy.sh "$STACK_NAME"
 ### Step 7: Close TCP 80 on the DataSync agent
 
 ```bash
-aws cloudformation deploy --template-file .packaged-template.yaml --stack-name "$STACK_NAME" --capabilities CAPABILITY_IAM --parameter-overrides ResourcePrefix=$STACK_NAME AgentActivationCidr= AgentCodeBucket=$ARTIFACT_BUCKET AgentCodeKey=$AGENT_KEY
+aws cloudformation deploy --template-file .packaged-template.yaml --stack-name "$STACK_NAME" --capabilities CAPABILITY_IAM --parameter-overrides ResourcePrefix=$STACK_NAME AgentActivationCidr= AgentCodeBucket=$ARTIFACT_BUCKET AgentCodeKey=$AGENT_KEY --tags Project=conversational-datasync-migration Purpose=sample
 ```
 
 ## Deployment Validation
@@ -515,8 +520,8 @@ This sample favors a simple, reproducible demo. Before using these patterns with
 | Area | What the sample does | For production |
 | --- | --- | --- |
 | Action surface | The agent can only call the six tools published on the Gateway. There is no tool to delete anything | Keep it that way. Add explicit confirmation and destination allow lists before adding destructive tools |
-| Agent permissions | The Lambda role can create DataSync locations and tasks (`datasync:Create*` cannot be scoped to resources that do not exist yet), start tasks, and describe log groups (DataSync validates a task's log group with the caller's credentials) | Add tag-based conditions and approval steps. Scope the DataSync S3 role to the destination bucket, as the sample does |
-| Prompt injection | The agent acts on user-supplied text and returns tool errors to the model | Apply Amazon Bedrock Guardrails, validate inputs in the Lambda function, and restrict who can invoke the Runtime |
+| Agent permissions | The Lambda role can create NFS locations on DataSync agents in this account and Region, create tasks between agents and locations in this account and Region, start tasks, and describe log groups (DataSync validates a task's log group with the caller's credentials). `datasync:CreateLocationS3` stays on `*` because its only resource type, `agent`, is used only for S3 on Outposts, so a Regional S3 request has no resource ARN to scope to. The function can pass only the DataSync S3 role, which can reach only the destination bucket. Both Lambda functions have reserved concurrency (5 and 1) | Scope `CreateLocationNfs` and `CreateTask` to your agent's ARN once it exists, and add tag-based conditions and approval steps |
+| Prompt injection | The agent acts on user-supplied text and returns tool errors to the model. The orchestrator function validates every tool argument before it calls an AWS API: ARNs must match the DataSync format and belong to this account and Region, and hostnames, paths, task names and search queries must match strict patterns. The model cannot choose the IAM role DataSync uses. The agent logs only the length of each prompt, not its text | Apply Amazon Bedrock Guardrails, allow only approved destination buckets, and restrict who can invoke the Runtime |
 | Agent activation | Opens TCP 80 on the agent only to your address during activation, then removes the rule | Activate through a [DataSync VPC endpoint](https://docs.aws.amazon.com/datasync/latest/userguide/datasync-in-vpc.html) from a private network |
 | Network egress | The agent and NFS server reach AWS services over the internet gateway on TCP 443, and the agent uses UDP 123 for NTP, as the DataSync network requirements list | Use VPC endpoints (DataSync, S3, Systems Manager, CloudWatch Logs) and remove the internet gateway |
 | Instances | Both instances are in a public subnet with public IPs, protected by security groups | Place them in private subnets |
@@ -526,7 +531,7 @@ This sample favors a simple, reproducible demo. Before using these patterns with
 | Encryption | S3 buckets use SSE-S3, both instances' EBS volumes are encrypted with the default EBS key, and the CloudWatch log groups use the default | Use customer managed AWS KMS keys where policy requires |
 | Logging | No S3 access logging, VPC flow logs or CloudTrail data events are configured | Enable them for the buckets and network that hold real data |
 
-The template passes `cfn-lint`. A Checkov scan reports findings that the table above covers: S3 access logging, KMS encryption for log groups and Lambda environment variables, wildcard resources on actions that cannot be scoped, and the Lambda functions not running in a VPC, with no dead-letter queue or reserved concurrency. These checks are not a substitute for your own security review.
+The template passes `cfn-lint` (apart from `W3002`, which flags the local code paths that `aws cloudformation package` replaces). A Checkov scan reports findings that the table above covers: S3 access logging, KMS encryption for log groups and Lambda environment variables, and the Lambda functions not running in a VPC or having a dead-letter queue. The tool argument validation has unit tests that need no AWS credentials: run `python3 -m unittest discover -s tests` from the repository root. These checks are not a substitute for your own security review.
 
 ### Limitations
 
@@ -564,8 +569,9 @@ The template passes `cfn-lint`. A Checkov scan reports findings that the table a
 ├── src/
 │   ├── orchestrator/
 │   │   ├── index.py                       Gateway Lambda target: dispatches tool calls
-│   │   └── datasync_tools.py              The five DataSync tools
+│   │   └── datasync_tools.py              The five DataSync tools and their input validation
 │   └── index_creator/index.py             Custom resource: creates the OpenSearch vector index
+├── tests/test_tool_validation.py          Unit tests for the tool argument validation
 ├── assets/datasync-best-practices.md      Knowledge base source document
 ├── docs/                                  Architecture and migration flow diagrams (.drawio and .png)
 ├── scripts/
@@ -573,6 +579,7 @@ The template passes `cfn-lint`. A Checkov scan reports findings that the table a
 │   ├── post-deploy.sh                     Upload doc, sync knowledge base, activate agent
 │   ├── chat.py                            Chat with MigrationBot from your terminal
 │   └── cleanup.sh                         Delete everything this sample created
+├── SECURITY.md                            Vulnerability reporting, security controls and accepted debt
 ├── CONTRIBUTING.md
 ├── CODE_OF_CONDUCT.md
 └── LICENSE
@@ -592,7 +599,7 @@ For any feedback, questions, or suggestions, use the [Issues](https://github.com
 
 ## Security
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+See [SECURITY](SECURITY.md) for how to report a security issue, the security controls in this sample, and the accepted security debt.
 
 ## License
 

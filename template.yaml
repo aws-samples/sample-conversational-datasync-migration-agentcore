@@ -23,6 +23,7 @@ Metadata:
           - ResourcePrefix
           - BedrockModelId
           - OpenSearchStandbyReplicas
+          - LambdaReservedConcurrency
       - Label:
           default: Agent code (set by scripts/deploy.sh)
         Parameters:
@@ -72,6 +73,19 @@ Parameters:
       the minimum capacity (and cost) and is suitable for a demo. Use ENABLED for
       production, which adds redundancy across Availability Zones. This cannot be
       changed after the collection is created.
+
+  LambdaReservedConcurrency:
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: >
+      ENABLED reserves concurrency for the Lambda functions (5 for the
+      orchestrator, 1 for the index creator), which caps how many tool calls
+      can run at once. Lambda rejects any reservation in accounts whose
+      concurrent executions quota is still at the new-account default of 10;
+      use DISABLED there, or request a quota increase.
 
   AgentCodeBucket:
     Type: String
@@ -128,6 +142,7 @@ Rules:
 
 Conditions:
   OpenActivationPort: !Not [!Equals [!Ref AgentActivationCidr, '']]
+  ReserveLambdaConcurrency: !Equals [!Ref LambdaReservedConcurrency, ENABLED]
 
 Resources:
 
@@ -460,6 +475,7 @@ Resources:
   NfsServerSSMRole:
     Type: AWS::IAM::Role
     Properties:
+      Description: !Sub 'MigrationBot sample (${ResourcePrefix}) - lets the simulated NFS server register with Systems Manager'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -479,6 +495,7 @@ Resources:
   DataSyncS3Role:
     Type: AWS::IAM::Role
     Properties:
+      Description: !Sub 'MigrationBot sample (${ResourcePrefix}) - assumed by DataSync to write to the destination bucket only'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -516,6 +533,7 @@ Resources:
   LambdaOrchestratorRole:
     Type: AWS::IAM::Role
     Properties:
+      Description: !Sub 'MigrationBot sample (${ResourcePrefix}) - orchestrator Lambda that runs the DataSync and knowledge base tools'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -548,14 +566,30 @@ Resources:
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
-              # These actions create new resources, so they cannot be scoped to
-              # resource ARNs that do not exist yet.
-              - Sid: Create
+              # Scoped by the resource types that the Service Authorization
+              # Reference lists for each action. The DataSync agent is
+              # activated after the stack is created, so its ARN is not known
+              # here; access is limited to agents and locations in this account
+              # and Region.
+              - Sid: CreateNfsLocation
                 Effect: Allow
-                Action:
-                  - datasync:CreateLocationNfs
-                  - datasync:CreateLocationS3
-                  - datasync:CreateTask
+                Action: datasync:CreateLocationNfs
+                Resource: !Sub 'arn:${AWS::Partition}:datasync:${AWS::Region}:${AWS::AccountId}:agent/*'
+              - Sid: CreateTask
+                Effect: Allow
+                Action: datasync:CreateTask
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:datasync:${AWS::Region}:${AWS::AccountId}:agent/*'
+                  - !Sub 'arn:${AWS::Partition}:datasync:${AWS::Region}:${AWS::AccountId}:location/*'
+              # The only resource type CreateLocationS3 lists is agent, which is
+              # used for S3 on Outposts. A request for a Regional S3 bucket names
+              # no agent, so there is no resource ARN to authorize against and
+              # the action needs '*'. What DataSync can then reach is still
+              # limited: PassRoleForDataSync lets this function pass only
+              # DataSyncS3Role, which can access only the destination bucket.
+              - Sid: CreateS3Location
+                Effect: Allow
+                Action: datasync:CreateLocationS3
                 Resource: '*'
               - Sid: RunAndInspectTasks
                 Effect: Allow
@@ -585,6 +619,7 @@ Resources:
   AgentCoreGatewayRole:
     Type: AWS::IAM::Role
     Properties:
+      Description: !Sub 'MigrationBot sample (${ResourcePrefix}) - assumed by the AgentCore Gateway to invoke the orchestrator Lambda'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -608,6 +643,7 @@ Resources:
   AgentCoreRuntimeRole:
     Type: AWS::IAM::Role
     Properties:
+      Description: !Sub 'MigrationBot sample (${ResourcePrefix}) - AgentCore Runtime execution role for the MigrationBot agent'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -702,6 +738,7 @@ Resources:
   BedrockKBRole:
     Type: AWS::IAM::Role
     Properties:
+      Description: !Sub 'MigrationBot sample (${ResourcePrefix}) - Bedrock Knowledge Base access to the docs bucket, embeddings and vector store'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -746,6 +783,7 @@ Resources:
   IndexCreatorRole:
     Type: AWS::IAM::Role
     Properties:
+      Description: !Sub 'MigrationBot sample (${ResourcePrefix}) - custom resource that creates the OpenSearch Serverless vector index'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -778,10 +816,15 @@ Resources:
       Timeout: 60
       MemorySize: 256
       Role: !GetAtt LambdaOrchestratorRole.Arn
+      # Caps concurrent tool calls so a runaway or abused agent cannot use up
+      # the account's Lambda concurrency.
+      ReservedConcurrentExecutions: !If [ReserveLambdaConcurrency, 5, !Ref AWS::NoValue]
       LoggingConfig:
         LogGroup: !Ref LambdaOrchestratorLogGroup
       Environment:
         Variables:
+          # Tool arguments must be ARNs in this account (and the function's Region).
+          ACCOUNT_ID: !Ref AWS::AccountId
           DATASYNC_S3_ROLE_ARN: !GetAtt DataSyncS3Role.Arn
           LOG_GROUP_ARN: !GetAtt DataSyncLogGroup.Arn
           KNOWLEDGE_BASE_ID: !Ref KnowledgeBase
@@ -839,16 +882,13 @@ Resources:
                 - Name: create_s3_location
                   Description: >
                     Register an Amazon S3 bucket as a DataSync destination location.
-                    The IAM role defaults to the stack's DataSync S3 access role.
+                    DataSync accesses the bucket with the stack's DataSync S3 access role.
                   InputSchema:
                     Type: object
                     Properties:
                       s3_bucket_arn:
                         Type: string
                         Description: ARN of the S3 bucket, for example arn:aws:s3:::my-bucket
-                      role_arn:
-                        Type: string
-                        Description: Optional IAM role ARN that DataSync uses to access the bucket
                     Required:
                       - s3_bucket_arn
 
@@ -1046,6 +1086,7 @@ Resources:
       Handler: index.handler
       Timeout: 600
       MemorySize: 256
+      ReservedConcurrentExecutions: !If [ReserveLambdaConcurrency, 1, !Ref AWS::NoValue]
       Role: !GetAtt IndexCreatorRole.Arn
       Code: src/index_creator/
 
